@@ -2,7 +2,6 @@
 #include <string>
 #include <memory>
 #include <algorithm>
-#include <libexif/exif-loader.h>
 #include <QImageReader>
 #include <QDir>
 #include "thumbnailer.h"
@@ -136,52 +135,6 @@ bool ThumbnailJob::isThumbnailOutdated(const std::shared_ptr<const FileInfo>& fi
     return (thumb_mtime.isEmpty() || thumb_mtime.toULongLong() != file->mtime());
 }
 
-bool ThumbnailJob::readJpegExif(GInputStream *stream, QImage& thumbnail, int& rotate_degrees) {
-    /* try to extract thumbnails embedded in jpeg files */
-    ExifLoader* exif_loader = exif_loader_new();
-    while(!isCancelled()) {
-        unsigned char buf[4096];
-        gssize read_size = g_input_stream_read(stream, buf, 4096, cancellable_.get(), nullptr);
-        if(read_size <= 0) { // EOF or error
-            break;
-        }
-        if(exif_loader_write(exif_loader, buf, read_size) == 0) {
-            break;    // no more EXIF data
-        }
-    }
-    ExifData* exif_data = exif_loader_get_data(exif_loader);
-    exif_loader_unref(exif_loader);
-    if(exif_data) {
-        /* reference for EXIF orientation tag:
-         * https://www.impulseadventure.com/photo/exif-orientation.html */
-        ExifEntry* orient_ent = exif_data_get_entry(exif_data, EXIF_TAG_ORIENTATION);
-        if(orient_ent) { /* orientation flag found in EXIF */
-            gushort orient;
-            ExifByteOrder bo = exif_data_get_byte_order(exif_data);
-            /* bo == EXIF_BYTE_ORDER_INTEL ; */
-            orient = exif_get_short(orient_ent->data, bo);
-            switch(orient) {
-            case 1: /* no rotation */
-                rotate_degrees = 0;
-                break;
-            case 8:
-                rotate_degrees = 90;
-                break;
-            case 3:
-                rotate_degrees = 180;
-                break;
-            case 6:
-                rotate_degrees = 270;
-                break;
-            }
-        }
-        if(exif_data->data) { // if an embedded thumbnail is available, load it
-            thumbnail.loadFromData(exif_data->data, exif_data->size);
-        }
-        exif_data_unref(exif_data);
-    }
-    return !thumbnail.isNull();
-}
 
 QImage ThumbnailJob::generateThumbnail(const std::shared_ptr<const FileInfo>& file, const FilePath& origPath, const char* uri, const QString& thumbnailFilename) {
     QImage result;
@@ -190,19 +143,11 @@ QImage ThumbnailJob::generateThumbnail(const std::shared_ptr<const FileInfo>& fi
         GFileInputStreamPtr ins{g_file_read(origPath.gfile().get(), cancellable_.get(), nullptr), false};
         if(!ins)
             return QImage();
-        bool fromExif = false;
         int rotate_degrees = 0;
-        if(strcmp(mime_type->name(), "image/jpeg") == 0) { // if this is a jpeg file
-            // try to get the thumbnail embedded in EXIF data
-            if(readJpegExif(G_INPUT_STREAM(ins.get()), result, rotate_degrees)) {
-                fromExif = true;
-            }
-        }
-        if(!fromExif) {  // not able to generate a thumbnail from the EXIF data
-            // load the original file and do the scaling ourselves
-            g_seekable_seek(G_SEEKABLE(ins.get()), 0, G_SEEK_SET, cancellable_.get(), nullptr);
-            result = readImageFromStream(G_INPUT_STREAM(ins.get()), file->size());
-        }
+        // not able to generate a thumbnail from the EXIF data
+        // load the original file and do the scaling ourselves
+        g_seekable_seek(G_SEEKABLE(ins.get()), 0, G_SEEK_SET, cancellable_.get(), nullptr);
+        result = readImageFromStream(G_INPUT_STREAM(ins.get()), file->size());
         g_input_stream_close(G_INPUT_STREAM(ins.get()), nullptr, nullptr);
 
         if(!result.isNull()) { // the image is successfully loaded
@@ -228,11 +173,9 @@ QImage ThumbnailJob::generateThumbnail(const std::shared_ptr<const FileInfo>& fi
             }
 
             // save the generated thumbnail to disk (don't save png thumbnails for JPEG EXIF thumbnails since loading them is cheap)
-            if(!fromExif) {
-                result.setText("Thumb::MTime", QString::number(file->mtime()));
-                result.setText("Thumb::URI", uri);
-                result.save(thumbnailFilename, "PNG");
-            }
+            result.setText("Thumb::MTime", QString::number(file->mtime()));
+            result.setText("Thumb::URI", uri);
+            result.save(thumbnailFilename, "PNG");
             // qDebug() << "save thumbnail:" << thumbnailFilename;
         }
     }
